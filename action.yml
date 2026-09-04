@@ -42,6 +42,10 @@ inputs:
   github-token:
     description: "Token gh uses to read target-repo's open PRs and fetch their heads."
     required: true
+  this-pr:
+    description: "Number of the PR this run belongs to. When set, the check fails only if THIS PR is part of a pair that does not build; other failing pairs are reported but do not fail the run."
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -62,4 +66,5 @@ runs:
         CODEMAP_REPO: ${{ inputs.codemap-repo }}
         CODEMAP_REF: ${{ inputs.codemap-ref }}
         GH_TOKEN: ${{ inputs.github-token }}
+        THIS_PR: ${{ inputs.this-pr }}
       run: bash "$GITHUB_ACTION_PATH/scripts/collide-check.sh"

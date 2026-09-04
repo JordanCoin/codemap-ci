@@ -72,3 +72,4 @@ jobs:
           build-command: ${{ github.event.inputs.build-command || 'go build ./... && go vet ./...' }}
           min-importers: ${{ github.event.inputs.min-importers || '0' }}
           github-token: ${{ steps.target.outputs.same == 'true' && github.token || secrets.CODEMAP_TARGET_TOKEN }}
+          this-pr: ${{ github.event.pull_request.number || '' }}
