@@ -43,6 +43,14 @@ jobs:
           go build -o "$RUNNER_TEMP/codemap" .
           "$RUNNER_TEMP/codemap" --version
 
+      # Without ast-grep codemap falls back to a partial graph, and a brief built
+      # on a partial graph is a brief that quietly leaves files out.
+      - name: Install ast-grep
+        run: |
+          set -euo pipefail
+          npm install --global @ast-grep/cli
+          ast-grep --version
+
       - name: Compute the facts
         env:
           # `codemap collide` shells out to gh to list the open PRs. gh is
