@@ -18,6 +18,8 @@ func main() {
 func report() {
 	fmt.Println(banner())
 
+	fmt.Println(greetAgain())
+
 	fmt.Println(footer())
 }
 
