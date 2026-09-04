@@ -1,0 +1,74 @@
+name: collide
+
+# Two ways in:
+#   pull_request      — checks this repo's own open PRs against each other.
+#   workflow_dispatch — points the same check at another repo's open PRs.
+#
+# Secrets: none are needed for the pull_request path (GITHUB_TOKEN reads this
+# repo). Pointing `target-repo` at a DIFFERENT repo needs a repo-scoped PAT
+# stored as the secret CODEMAP_TARGET_TOKEN — GITHUB_TOKEN is scoped to this
+# repo alone and cannot read another repo's PRs. This workflow does not create
+# that secret; add it under Settings → Secrets and variables → Actions.
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      target-repo:
+        description: "owner/name whose open PRs get pair-built"
+        required: false
+        default: "JordanCoin/codemap"
+      build-command:
+        description: "Command run in each merged worktree"
+        required: false
+        default: "go build ./... && go vet ./..."
+      min-importers:
+        description: "Hide shared files with fewer importers than this"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  collide:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pick the target
+        id: target
+        env:
+          INPUT_TARGET: ${{ github.event.inputs.target-repo }}
+        run: |
+          set -euo pipefail
+          target="${INPUT_TARGET:-${{ github.repository }}}"
+          echo "repo=$target" >>"$GITHUB_OUTPUT"
+          if [ "$target" = "${{ github.repository }}" ]; then
+            echo "same=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "same=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out codemap-ci (the action itself)
+        uses: actions/checkout@v4
+        with:
+          path: codemap-ci
+
+      # Full history: the check merges PR heads onto the base branch in throwaway
+      # worktrees, which a shallow clone cannot do.
+      - name: Check out the target repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.target.outputs.repo }}
+          path: target
+          fetch-depth: 0
+          token: ${{ steps.target.outputs.same == 'true' && github.token || secrets.CODEMAP_TARGET_TOKEN }}
+
+      - name: Pair-build the predicted collisions
+        uses: ./codemap-ci
+        with:
+          target-repo: ${{ steps.target.outputs.repo }}
+          target-dir: ${{ github.workspace }}/target
+          build-command: ${{ github.event.inputs.build-command || 'go build ./... && go vet ./...' }}
+          min-importers: ${{ github.event.inputs.min-importers || '0' }}
+          github-token: ${{ steps.target.outputs.same == 'true' && github.token || secrets.CODEMAP_TARGET_TOKEN }}

@@ -1,0 +1,65 @@
+name: "codemap collide check"
+description: "Pair-build the open PRs that share hot files, so a merge-order collision goes red before it lands."
+author: "JordanCoin"
+
+branding:
+  icon: "git-merge"
+  color: "red"
+
+inputs:
+  target-repo:
+    description: "owner/name whose open PRs are read. Defaults to the repo running the workflow."
+    required: false
+    default: ""
+  target-dir:
+    description: "Path to a git checkout of target-repo. Must be a full clone (fetch-depth: 0)."
+    required: false
+    default: ""
+  build-command:
+    description: "Command run inside each merged worktree. Non-zero exit = the pair collides."
+    required: false
+    default: "go build ./... && go vet ./..."
+  min-importers:
+    description: "Hide shared files with fewer importers than this. 0 shows every hazard."
+    required: false
+    default: "0"
+  base-branch:
+    description: "Branch the pairs are merged onto. Defaults to target-repo's default branch."
+    required: false
+    default: ""
+  codemap-repo:
+    description: "Git URL codemap is built from."
+    required: false
+    default: "https://github.com/JordanCoin/codemap.git"
+  codemap-ref:
+    description: "Ref of codemap-repo to build. `collide` shipped in codemap #180, so main carries it."
+    required: false
+    default: "main"
+  go-version:
+    description: "Go toolchain used to build codemap (and, by default, the pairs)."
+    required: false
+    default: "1.24"
+  github-token:
+    description: "Token gh uses to read target-repo's open PRs and fetch their heads."
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ inputs.go-version }}
+
+    - name: Run collide check
+      shell: bash
+      env:
+        TARGET_REPO: ${{ inputs.target-repo != '' && inputs.target-repo || github.repository }}
+        TARGET_DIR: ${{ inputs.target-dir != '' && inputs.target-dir || github.workspace }}
+        BUILD_COMMAND: ${{ inputs.build-command }}
+        MIN_IMPORTERS: ${{ inputs.min-importers }}
+        BASE_BRANCH: ${{ inputs.base-branch }}
+        CODEMAP_REPO: ${{ inputs.codemap-repo }}
+        CODEMAP_REF: ${{ inputs.codemap-ref }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/collide-check.sh"
