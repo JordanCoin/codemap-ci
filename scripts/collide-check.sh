@@ -104,9 +104,9 @@ if [ -n "$PAIR_PRS" ]; then
 fi
 git -C "$TARGET_DIR" fetch --force origin "$BASE_BRANCH:refs/collide-check/base"
 
-# Merges need an identity; the worktrees are thrown away either way.
-git -C "$TARGET_DIR" config user.name "codemap-ci"
-git -C "$TARGET_DIR" config user.email "codemap-ci@users.noreply.github.com"
+# Merges need an identity. Passed per-command with -c rather than written with
+# `git config`, so running this against a working checkout leaves no trace.
+GIT_ID=(-c "user.name=codemap-ci" -c "user.email=codemap-ci@users.noreply.github.com")
 
 # ---------------------------------------------------------------------------
 # 5. pair builds
@@ -126,7 +126,7 @@ build_pair() {
 	local merged=1
 	local ref
 	for ref in "refs/collide-check/pr-$a" "refs/collide-check/pr-$b"; do
-		if ! git -C "$wt" merge --no-edit "$ref" >"$err.merge" 2>&1; then
+		if ! git -C "$wt" "${GIT_ID[@]}" merge --no-edit "$ref" >"$err.merge" 2>&1; then
 			status="merge conflict"
 			cp "$err.merge" "$err"
 			merged=0
