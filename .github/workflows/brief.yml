@@ -1,0 +1,99 @@
+name: brief
+
+# Compute the facts behind the live codebase brief and hand them to the managed
+# webhook, which keeps the latest snapshot per repository for the page to read.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: brief-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+        with:
+          # Full history: the pair builds merge PR heads onto main in a worktree.
+          fetch-depth: 0
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      # codemap's go.mod declares the module as `codemap`, not its GitHub path,
+      # so `go install github.com/JordanCoin/codemap@main` cannot resolve it.
+      # Clone main and build the binary instead.
+      - name: Build codemap from main
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/JordanCoin/codemap.git "$RUNNER_TEMP/codemap-src"
+          cd "$RUNNER_TEMP/codemap-src"
+          go build -o "$RUNNER_TEMP/codemap" .
+          "$RUNNER_TEMP/codemap" --version
+
+      # Without ast-grep codemap falls back to a partial graph, and a brief built
+      # on a partial graph is a brief that quietly leaves files out.
+      - name: Install ast-grep
+        run: |
+          set -euo pipefail
+          npm install --global @ast-grep/cli
+          ast-grep --version
+
+      - name: Compute the facts
+        env:
+          # `codemap collide` shells out to gh to list the open PRs. gh is
+          # preinstalled on ubuntu runners and reads its token from the env.
+          GH_TOKEN: ${{ github.token }}
+          CODEMAP_BIN: ${{ runner.temp }}/codemap
+        run: python3 scripts/brief-facts.py --repo . --out "$RUNNER_TEMP/facts.json"
+
+      - name: Post the facts to the brief webhook
+        env:
+          BRIEF_WEBHOOK_URL: ${{ secrets.BRIEF_WEBHOOK_URL }}
+          BRIEF_WEBHOOK_SECRET: ${{ secrets.BRIEF_WEBHOOK_SECRET }}
+          BRIEF_BYPASS_SECRET: ${{ secrets.BRIEF_BYPASS_SECRET }}
+        run: |
+          set -euo pipefail
+
+          python3 - "$RUNNER_TEMP/facts.json" "$RUNNER_TEMP/payload.json" <<'PY'
+          import json, os, sys, datetime
+          facts = json.load(open(sys.argv[1]))
+          payload = {
+              "repo": os.environ["GITHUB_REPOSITORY"],
+              "sha": os.environ["GITHUB_SHA"],
+              "ref": os.environ["GITHUB_REF"],
+              "facts": facts,
+              "computed_at": datetime.datetime.now(datetime.timezone.utc)
+                  .replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+          }
+          json.dump(payload, open(sys.argv[2], "w"))
+          print(f"payload {os.path.getsize(sys.argv[2])} bytes for {payload['sha']}")
+          PY
+
+          # The secrets reach curl through a config read on stdin, so they never
+          # appear in the process list or in the workflow log.
+          {
+            printf 'header = "x-brief-secret: %s"\n' "$BRIEF_WEBHOOK_SECRET"
+            if [ -n "$BRIEF_BYPASS_SECRET" ]; then
+              printf 'header = "x-vercel-protection-bypass: %s"\n' "$BRIEF_BYPASS_SECRET"
+            fi
+          } | curl -sS -K - \
+              --fail-with-body \
+              --retry 3 --retry-connrefused \
+              -X POST \
+              -H 'content-type: application/json' \
+              --data "@$RUNNER_TEMP/payload.json" \
+              "$BRIEF_WEBHOOK_URL/api/webhook"
+          echo
