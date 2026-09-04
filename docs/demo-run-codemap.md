@@ -1,7 +1,19 @@
 # Demo run: codemap-ci pointed at JordanCoin/codemap
 
 `workflow_dispatch` against a **different** repo needs the `CODEMAP_TARGET_TOKEN` secret,
-which does not exist on this repository (this repo does not create secrets). So this run was
+which does not exist on this repository (this repo does not create secrets).
+
+That was confirmed, not assumed. Run
+[33888438962](https://github.com/JordanCoin/codemap-ci/actions/runs/33888438962)
+dispatched `target-repo=JordanCoin/codemap` and failed in 10s at the checkout step:
+
+```
+Check out the target repo
+##[error]Input required and not supplied: token
+```
+
+To make the dispatch path work, add a repo-scoped PAT as `CODEMAP_TARGET_TOKEN`
+under Settings -> Secrets and variables -> Actions. Until then, this run was
 produced by running `scripts/collide-check.sh` locally with the maintainer's `gh` auth:
 
 ```
