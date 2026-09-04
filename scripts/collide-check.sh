@@ -32,6 +32,7 @@ CODEMAP_REPO="${CODEMAP_REPO:-https://github.com/JordanCoin/codemap.git}"
 CODEMAP_REF="${CODEMAP_REF:-main}"
 CODEMAP_BIN="${CODEMAP_BIN:-}"
 SUMMARY_FILE="${SUMMARY_FILE:-${GITHUB_STEP_SUMMARY:-}}"
+THIS_PR="${THIS_PR:-}" # when set, only a failing pair that includes this PR fails the run
 
 die() {
 	echo "collide-check: $*" >&2
@@ -114,6 +115,7 @@ git -C "$TARGET_DIR" config user.email "codemap-ci@users.noreply.github.com"
 RESULTS="$WORK_ROOT/results.tsv" # a<TAB>b<TAB>status<TAB>errfile
 : >"$RESULTS"
 FAILED=0
+FAILED_MINE=0
 
 build_pair() {
 	local a="$1" b="$2"
@@ -144,6 +146,9 @@ build_pair() {
 	printf '%s\t%s\t%s\t%s\n' "$a" "$b" "$status" "$err" >>"$RESULTS"
 	if [ "$status" != "pass" ]; then
 		FAILED=$((FAILED + 1))
+		if [ -n "$THIS_PR" ] && { [ "$a" = "$THIS_PR" ] || [ "$b" = "$THIS_PR" ]; }; then
+			FAILED_MINE=$((FAILED_MINE + 1))
+		fi
 	fi
 	echo "collide-check: #$a + #$b -> $status" >&2
 }
@@ -217,6 +222,15 @@ MD="$WORK_ROOT/summary.md"
 
 	if [ "$FAILED" -gt 0 ]; then
 		echo "**$FAILED predicted pair(s) do not build together.** Each one is green on its own."
+		if [ -n "$THIS_PR" ]; then
+			if [ "$FAILED_MINE" -gt 0 ]; then
+				echo
+				echo "PR #$THIS_PR is part of $FAILED_MINE of them, so this check fails for it."
+			else
+				echo
+				echo "PR #$THIS_PR is not part of any failing pair, so this check passes for it. The failing pairs belong to other open PRs."
+			fi
+		fi
 	else
 		echo "All predicted pairs build together."
 	fi
@@ -227,6 +241,12 @@ if [ -n "$SUMMARY_FILE" ]; then
 fi
 cat "$MD"
 
+if [ -n "$THIS_PR" ]; then
+	if [ "$FAILED_MINE" -gt 0 ]; then
+		exit 1
+	fi
+	exit 0
+fi
 if [ "$FAILED" -gt 0 ]; then
 	exit 1
 fi
