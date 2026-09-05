@@ -127,3 +127,18 @@ worktrees and reports.
 ## Live brief
 
 Each commit on the default branch recomputes the facts and posts them to the brief webhook; the live page picks it up within about a minute.
+
+The facts carry a bounded copy of the code as well as the graph, so the page can
+answer questions about the source and not only about its shape:
+
+| Key | What it holds |
+| --- | --- |
+| `index` | `{path: {"text", "lines"}}`, the first 24 KB of each text file |
+| `last_change` | `{path: {"sha", "author", "date", "message", "patch"}}` from `git log -1` |
+| `index_capped` | true when the 3 MB total index cap was reached |
+| `index_dropped` | paths whose text was shed to keep the POST under the size limit |
+
+Not indexed: binaries, lockfiles, minified files, anything over 256 KB, and
+anything under a vendored or build directory. Patches are trimmed to 80 lines.
+The workflow checks out with `fetch-depth: 0`, which the last-change lookups
+need as much as the pair builds do.

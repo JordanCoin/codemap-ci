@@ -1,2 +1,4 @@
 # `go build ./...` names the binary after the module: github.com/.../demo
 /demo
+__pycache__/
+*.pyc
