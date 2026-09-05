@@ -123,3 +123,7 @@ then proven. See `docs/proof.md`.
 
 It does not merge, rebase, close, or comment on anything. It builds throwaway
 worktrees and reports.
+
+## Live brief
+
+Each commit on the default branch recomputes the facts and posts them to the brief webhook; the live page picks it up within about a minute.
