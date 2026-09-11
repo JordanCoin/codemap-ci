@@ -21,6 +21,7 @@
 #   COMMENT          "true" posts a sticky comment on THIS_PR (default: true)
 #   SUMMARY_FILE     markdown destination (default: $GITHUB_STEP_SUMMARY, else none)
 #   GH_TOKEN         token gh uses to read TARGET_REPO's open PRs
+#   CALIBRATION_OUT  copy calibration.jsonl (one line per built pair) here when set
 #
 # Exit status: 0 when every built pair passes, 1 when a pair fails. With THIS_PR
 # set, only a failing pair that includes THIS_PR fails the run.
@@ -45,7 +46,7 @@ die() {
 	exit 2
 }
 
-for tool in git gh jq curl tar; do
+for tool in git gh jq curl tar python3; do
 	command -v "$tool" >/dev/null || die "$tool not found on PATH"
 done
 [ -n "$TARGET_REPO" ] || die "TARGET_REPO is required (owner/name)"
@@ -155,11 +156,26 @@ RESULTS="$WORK_ROOT/results.tsv" # a<TAB>b<TAB>status<TAB>logfile
 FAILED=0
 FAILED_MINE=0
 
+# ponytail: shared-file heuristic, calibrate from calibration.jsonl once there
+# are ~50 built pairs. Until then this is a prior, not a measurement.
+pair_likelihood() { # a b -> high|medium|low|unknown
+	jq -r --argjson a "$1" --argjson b "$2" '.pairs[] | select(.a == $a and .b == $b) |
+		if .shared_file_count >= 3 or (.top_importers_known and .top_importer_count >= 3) then "high"
+		elif .shared_file_count == 2 then "medium"
+		elif .top_importers_known then "low"
+		else "unknown" end' "$REPORT"
+}
+
+CALIBRATION="$WORK_ROOT/calibration.jsonl"
+: >"$CALIBRATION"
+
 build_pair() {
 	local a="$1" b="$2"
 	local wt="$WORK_ROOT/pair-$a-$b"
 	local log="$WORK_ROOT/pair-$a-$b.log"
 	local status="pass"
+	local started
+	started="$(date +%s)"
 
 	if ! git -C "$TARGET_DIR" worktree add --detach "$wt" "refs/collide-check/base" >"$log" 2>&1; then
 		status="worktree failed"
@@ -187,6 +203,13 @@ build_pair() {
 	fi
 
 	printf '%s\t%s\t%s\t%s\n' "$a" "$b" "$status" "$log" >>"$RESULTS"
+	jq -c -n --arg repo "$TARGET_REPO" --argjson a "$a" --argjson b "$b" --arg status "$status" \
+		--arg likelihood "$(pair_likelihood "$a" "$b")" --argjson seconds "$(($(date +%s) - started))" \
+		--argjson pair "$(jq -c --argjson a "$a" --argjson b "$b" '.pairs[] | select(.a == $a and .b == $b)' "$REPORT")" \
+		'{repo: $repo, a: $a, b: $b, shared_file_count: $pair.shared_file_count,
+		  top_importer_count: (if $pair.top_importers_known then $pair.top_importer_count else null end),
+		  any_hub: ($pair.top_importers_known and $pair.top_importer_count >= 3),
+		  likelihood: $likelihood, outcome: $status, seconds: $seconds}' >>"$CALIBRATION"
 	if [ "$status" != "pass" ]; then
 		FAILED=$((FAILED + 1))
 		if [ -n "$THIS_PR" ] && { [ "$a" = "$THIS_PR" ] || [ "$b" = "$THIS_PR" ]; }; then
@@ -200,13 +223,18 @@ while read -r a b; do
 	[ -n "$a" ] || continue
 	build_pair "$a" "$b"
 done < <(jq -r '.[] | "\(.a) \(.b)"' <<<"$BUILD_PAIRS")
+if [ -n "${CALIBRATION_OUT:-}" ]; then
+	cp "$CALIBRATION" "$CALIBRATION_OUT"
+fi
 
 # ---------------------------------------------------------------------------
 # 6. blast radius of THIS_PR: which of its files do other files depend on
 # ---------------------------------------------------------------------------
-BLAST="$WORK_ROOT/blast.tsv" # count<TAB>path
+BLAST="$WORK_ROOT/blast.tsv" # count<TAB>hub<TAB>path
 : >"$BLAST"
 BLAST_NOTE=""
+BLAST_LEVEL=""
+BLAST_LINE=""
 if [ -n "$THIS_PR" ]; then
 	changed="$(git -C "$TARGET_DIR" diff --name-only "refs/collide-check/base...refs/collide-check/pr-$THIS_PR" 2>/dev/null || true)"
 	changed_count="$(printf '%s' "$changed" | grep -c . || true)"
@@ -216,10 +244,29 @@ if [ -n "$THIS_PR" ]; then
 		while read -r path; do
 			[ -n "$path" ] || continue
 			[ -f "$TARGET_DIR/$path" ] || continue
-			n="$(cd "$TARGET_DIR" && "$CODEMAP_BIN" --json --importers "$path" 2>/dev/null | jq -r '.importer_count // 0' || echo 0)"
-			[ "${n:-0}" -gt 0 ] && printf '%s\t%s\n' "$n" "$path" >>"$BLAST"
+			row="$(cd "$TARGET_DIR" && "$CODEMAP_BIN" --json --importers "$path" 2>/dev/null |
+				jq -r '"\(.importer_count // 0)\t\(if .is_hub then 1 else 0 end)\t\(.coverage_status // "unknown")"' || echo "0	0	unavailable")"
+			n="${row%%	*}"
+			case "$row" in *unavailable) BLAST_UNAVAILABLE=1 ;; esac
+			[ "${n:-0}" -gt 0 ] && printf '%s\t%s\n' "$row" "$path" >>"$BLAST"
 		done <<<"$changed"
 		sort -rn -o "$BLAST" "$BLAST"
+	fi
+	# Level: codemap calls 3 importers a hub; 9 (3x) or two hubs in one PR is high.
+	top="$(head -1 "$BLAST" | cut -f1)"
+	hubs="$(awk -F'\t' '$2 == 1' "$BLAST" | wc -l | tr -d ' ')"
+	if [ -n "$BLAST_NOTE" ] || { [ "${BLAST_UNAVAILABLE:-0}" -eq 1 ] && [ ! -s "$BLAST" ]; }; then
+		BLAST_LEVEL="unknown"
+	elif [ "${top:-0}" -ge 9 ] || [ "$hubs" -ge 2 ]; then
+		BLAST_LEVEL="high"
+	elif [ "$hubs" -ge 1 ]; then
+		BLAST_LEVEL="medium"
+	else
+		BLAST_LEVEL="low"
+	fi
+	BLAST_LINE="Blast radius: $(tr '[:lower:]' '[:upper:]' <<<"$BLAST_LEVEL")"
+	if [ -s "$BLAST" ]; then
+		BLAST_LINE="$BLAST_LINE · $(head -1 "$BLAST" | awk -F'\t' '{ printf "%s %s importers", $4, $1 }') · $hubs hub(s) touched"
 	fi
 fi
 
@@ -230,6 +277,55 @@ pair_shared() { # top file line for a pair from the report
 	jq -r --argjson a "$1" --argjson b "$2" '.pairs[] | select(.a == $a and .b == $b) |
 		"\(.top_file) (" + (if .top_importers_known then (.top_importer_count | tostring) + " importers" else "importers unknown" end) + ")" +
 		(if .shared_file_count > 1 then " · +\(.shared_file_count - 1) more" else "" end)' "$REPORT"
+}
+
+# ponytail: greedy order (fewest failing edges first, older first on ties), not
+# optimal. Fine below ~15 open PRs; switch to a proper feedback-arc solver past that.
+merge_order() {
+	python3 - "$RESULTS" "$THIS_PR" <<'PY'
+import sys
+results, this_pr = sys.argv[1], sys.argv[2]
+edges = set()
+nodes = set()
+for line in open(results):
+    a, b, status, _ = line.rstrip("\n").split("\t")
+    a, b = int(a), int(b)
+    nodes |= {a, b}
+    if status != "pass":
+        edges.add(frozenset((a, b)))
+if this_pr:
+    nodes.add(int(this_pr))
+if not edges:
+    print("Every built pair passes; any order works.")
+    sys.exit(0)
+bad = {n: {next(iter(e - {n})) for e in edges if n in e} for n in nodes}
+landed, order = [], []
+remaining = set(nodes)
+while remaining:
+    pick = min(remaining, key=lambda n: (len(bad[n] & remaining), n))
+    after = sorted(bad[pick] & set(landed))
+    order.append((pick, after))
+    landed.append(pick)
+    remaining.remove(pick)
+me = int(this_pr) if this_pr else None
+if me is not None and bad[me]:
+    pos = {n: i for i, (n, _) in enumerate(order)}
+    before = sorted(n for n in bad[me] if pos[n] < pos[me])
+    if before:
+        print(f"Land {', '.join(f'#{n}' for n in before)} first, then rebase this PR (#{me}).")
+    else:
+        others = sorted(bad[me])
+        if others:
+            print(f"Land this PR (#{me}) first; {', '.join(f'#{n}' for n in others)} must rebase after it.")
+    print()
+for i, (n, after) in enumerate(order, 1):
+    tail = f" (rebase after {', '.join(f'#{a}' for a in after)})" if after else ""
+    print(f"{i}. #{n}{tail}")
+# Pairs where neither side can land as-is on top of the other: the human picks one.
+for e in sorted(edges, key=lambda e: tuple(sorted(e))):
+    a, b = sorted(e)
+    print(f"\n#{a} and #{b}: only one can land as-is; keep the older (#{a}) unless told otherwise.")
+PY
 }
 
 VERDICT=""
@@ -257,7 +353,7 @@ if [ -n "$THIS_PR" ]; then
 else
 	VERDICT="$PR_COUNT open PR(s), $SHARED_COUNT shared file(s), $BUILD_COUNT pair(s) built, $FAILED failing."
 fi
-echo "::notice title=codemap collide::$VERDICT"
+echo "::notice title=codemap collide::$VERDICT${BLAST_LEVEL:+ · blast radius $BLAST_LEVEL}"
 
 # Inline annotations on THIS_PR's diff for compiler-style "path:line: msg" lines.
 if [ -n "$THIS_PR" ] && [ "$FAILED_MINE" -gt 0 ]; then
@@ -273,7 +369,7 @@ fi
 
 BODY="$WORK_ROOT/body.md" # summary without the H2, reused for the comment
 {
-	echo "**$VERDICT**"
+	echo "**$VERDICT**${BLAST_LEVEL:+ · blast radius \`$BLAST_LEVEL\`}"
 	echo
 
 	if awk -F'\t' '$3 != "pass"' "$RESULTS" | grep -q .; then
@@ -281,7 +377,7 @@ BODY="$WORK_ROOT/body.md" # summary without the H2, reused for the comment
 		echo
 		while IFS=$'\t' read -r a b status log; do
 			[ "$status" = "pass" ] && continue
-			echo "**#$a + #$b** · $status · shared: $(pair_shared "$a" "$b")"
+			echo "**#$a + #$b** · $status · likelihood \`$(pair_likelihood "$a" "$b")\` · shared: $(pair_shared "$a" "$b")"
 			echo
 			echo '```'
 			head -12 "$log"
@@ -295,27 +391,39 @@ BODY="$WORK_ROOT/body.md" # summary without the H2, reused for the comment
 		echo
 		while IFS=$'\t' read -r a b status log; do
 			[ "$status" = "pass" ] || continue
-			echo "- #$a + #$b · shared: $(pair_shared "$a" "$b")"
+			echo "- #$a + #$b · likelihood \`$(pair_likelihood "$a" "$b")\` · shared: $(pair_shared "$a" "$b")"
 		done <"$RESULTS"
+		echo
+	fi
+
+	if awk -F'\t' '$3 != "pass"' "$RESULTS" | grep -q .; then
+		echo "### Merge order"
+		echo
+		merge_order
 		echo
 	fi
 
 	if [ "$(jq 'length' <<<"$OTHER_PAIRS")" -gt 0 ]; then
 		echo "### Predicted, not built in this run"
 		echo
-		jq -r '.[] | "- #\(.a) + #\(.b) · shared: \(.top_file)"' <<<"$OTHER_PAIRS"
+		while read -r a b; do
+			[ -n "$a" ] || continue
+			echo "- #$a + #$b · likelihood \`$(pair_likelihood "$a" "$b")\` · shared: $(pair_shared "$a" "$b")"
+		done < <(jq -r '.[] | "\(.a) \(.b)"' <<<"$OTHER_PAIRS")
 		echo
 		echo "These pairs do not include #$THIS_PR; their own PRs' runs build them."
 		echo
 	fi
 
-	if [ -s "$BLAST" ] || [ -n "$BLAST_NOTE" ]; then
+	if [ -n "$BLAST_LEVEL" ]; then
 		echo "### Files in this PR that others depend on"
+		echo
+		echo "$BLAST_LINE"
 		echo
 		if [ -n "$BLAST_NOTE" ]; then
 			echo "$BLAST_NOTE"
 		else
-			head -5 "$BLAST" | awk -F'\t' '{ printf "- `%s` · %s importers\n", $2, $1 }'
+			head -5 "$BLAST" | awk -F'\t' '{ printf "- `%s` · %s importers%s\n", $4, $1, ($2 == 1 ? " (hub)" : "") }'
 		fi
 		echo
 	fi

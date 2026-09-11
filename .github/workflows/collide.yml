@@ -89,3 +89,14 @@ jobs:
           github-token: ${{ steps.target.outputs.same == 'true' && github.token || secrets.CODEMAP_TARGET_TOKEN }}
           this-pr: ${{ github.event.pull_request.number || '' }}
           all-pairs: ${{ github.event.inputs.all-pairs || 'false' }}
+
+      # One JSON line per built pair: predicted likelihood next to the real
+      # outcome. Download a few weeks of these to learn the actual hit rate.
+      - name: Keep the calibration log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: collide-calibration-${{ github.run_id }}
+          path: ${{ runner.temp }}/collide-calibration.jsonl
+          if-no-files-found: ignore
+          retention-days: 90
