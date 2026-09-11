@@ -26,10 +26,18 @@ on:
         description: "Hide shared files with fewer importers than this"
         required: false
         default: "0"
+      all-pairs:
+        description: "Build every predicted pair"
+        required: false
+        default: "true"
 
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: write
+
+concurrency:
+  group: collide-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   collide:
@@ -50,19 +58,26 @@ jobs:
           fi
 
       - name: Check out codemap-ci (the action itself)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: codemap-ci
 
       # Full history: the check merges PR heads onto the base branch in throwaway
       # worktrees, which a shallow clone cannot do.
       - name: Check out the target repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ steps.target.outputs.repo }}
           path: target
           fetch-depth: 0
           token: ${{ steps.target.outputs.same == 'true' && github.token || secrets.CODEMAP_TARGET_TOKEN }}
+
+      # The demo repo's build command is Go; the action itself installs only codemap.
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.24"
+          cache: false
 
       - name: Pair-build the predicted collisions
         uses: ./codemap-ci
@@ -73,3 +88,4 @@ jobs:
           min-importers: ${{ github.event.inputs.min-importers || '0' }}
           github-token: ${{ steps.target.outputs.same == 'true' && github.token || secrets.CODEMAP_TARGET_TOKEN }}
           this-pr: ${{ github.event.pull_request.number || '' }}
+          all-pairs: ${{ github.event.inputs.all-pairs || 'false' }}
