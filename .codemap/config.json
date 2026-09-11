@@ -1,0 +1,15 @@
+{
+  "only": [
+    "yml",
+    "go",
+    "py",
+    "sh"
+  ],
+  "mode": "auto",
+  "budgets": {},
+  "routing": {
+    "retrieval": {}
+  },
+  "drift": {},
+  "guidance": {}
+}
