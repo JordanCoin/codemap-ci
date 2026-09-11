@@ -70,4 +70,5 @@ runs:
         PAIR_TIMEOUT: ${{ inputs.pair-timeout }}
         GH_TOKEN: ${{ inputs.github-token }}
         THIS_PR: ${{ inputs.this-pr }}
+        CALIBRATION_OUT: ${{ runner.temp }}/collide-calibration.jsonl
       run: bash "$GITHUB_ACTION_PATH/scripts/collide-check.sh"
