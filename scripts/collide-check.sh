@@ -156,8 +156,8 @@ RESULTS="$WORK_ROOT/results.tsv" # a<TAB>b<TAB>status<TAB>logfile
 FAILED=0
 FAILED_MINE=0
 
-# ponytail: shared-file heuristic, calibrate from calibration.jsonl once there
-# are ~50 built pairs. Until then this is a prior, not a measurement.
+# ponytail: shared-file prior, written ONLY to calibration.jsonl so it can be
+# measured against outcomes. It is never printed: an unmeasured guess is not a fact.
 pair_likelihood() { # a b -> high|medium|low|unknown
 	jq -r --argjson a "$1" --argjson b "$2" '.pairs[] | select(.a == $a and .b == $b) |
 		if .shared_file_count >= 3 or (.top_importers_known and .top_importer_count >= 3) then "high"
@@ -264,9 +264,11 @@ if [ -n "$THIS_PR" ]; then
 	else
 		BLAST_LEVEL="low"
 	fi
-	BLAST_LINE="Blast radius: $(tr '[:lower:]' '[:upper:]' <<<"$BLAST_LEVEL")"
+	# Facts first, label last, threshold stated: the number is the finding.
 	if [ -s "$BLAST" ]; then
-		BLAST_LINE="$BLAST_LINE · $(head -1 "$BLAST" | awk -F'\t' '{ printf "%s %s importers", $4, $1 }') · $hubs hub(s) touched"
+		BLAST_LINE="$(head -1 "$BLAST" | awk -F'\t' '{ printf "`%s` · %s importers", $4, $1 }') · $hubs hub(s) touched · blast $BLAST_LEVEL (high = 9+ importers or 2 hubs)"
+	else
+		BLAST_LINE="No changed file has importers · blast $BLAST_LEVEL"
 	fi
 fi
 
@@ -353,7 +355,7 @@ if [ -n "$THIS_PR" ]; then
 else
 	VERDICT="$PR_COUNT open PR(s), $SHARED_COUNT shared file(s), $BUILD_COUNT pair(s) built, $FAILED failing."
 fi
-echo "::notice title=codemap collide::$VERDICT${BLAST_LEVEL:+ · blast radius $BLAST_LEVEL}"
+echo "::notice title=codemap collide::$VERDICT"
 
 # Inline annotations on THIS_PR's diff for compiler-style "path:line: msg" lines.
 if [ -n "$THIS_PR" ] && [ "$FAILED_MINE" -gt 0 ]; then
@@ -369,7 +371,7 @@ fi
 
 BODY="$WORK_ROOT/body.md" # summary without the H2, reused for the comment
 {
-	echo "**$VERDICT**${BLAST_LEVEL:+ · blast radius \`$BLAST_LEVEL\`}"
+	echo "**$VERDICT**"
 	echo
 
 	if awk -F'\t' '$3 != "pass"' "$RESULTS" | grep -q .; then
@@ -377,7 +379,7 @@ BODY="$WORK_ROOT/body.md" # summary without the H2, reused for the comment
 		echo
 		while IFS=$'\t' read -r a b status log; do
 			[ "$status" = "pass" ] && continue
-			echo "**#$a + #$b** · $status · likelihood \`$(pair_likelihood "$a" "$b")\` · shared: $(pair_shared "$a" "$b")"
+			echo "**#$a + #$b** · $status · shared: $(pair_shared "$a" "$b")"
 			echo
 			echo '```'
 			head -12 "$log"
@@ -391,7 +393,7 @@ BODY="$WORK_ROOT/body.md" # summary without the H2, reused for the comment
 		echo
 		while IFS=$'\t' read -r a b status log; do
 			[ "$status" = "pass" ] || continue
-			echo "- #$a + #$b · likelihood \`$(pair_likelihood "$a" "$b")\` · shared: $(pair_shared "$a" "$b")"
+			echo "- #$a + #$b · shared: $(pair_shared "$a" "$b")"
 		done <"$RESULTS"
 		echo
 	fi
@@ -408,7 +410,7 @@ BODY="$WORK_ROOT/body.md" # summary without the H2, reused for the comment
 		echo
 		while read -r a b; do
 			[ -n "$a" ] || continue
-			echo "- #$a + #$b · likelihood \`$(pair_likelihood "$a" "$b")\` · shared: $(pair_shared "$a" "$b")"
+			echo "- #$a + #$b · shared: $(pair_shared "$a" "$b")"
 		done < <(jq -r '.[] | "\(.a) \(.b)"' <<<"$OTHER_PAIRS")
 		echo
 		echo "These pairs do not include #$THIS_PR; their own PRs' runs build them."

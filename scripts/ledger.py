@@ -2,7 +2,7 @@
 """ledger.py: the morning read for a fleet of agent PRs across repos.
 
 For each repo: what opened, merged and is still open in the window, grouped by
-the Claude session that authored it, with a blast level for merged PRs (how many
+the Claude session that authored it, with importer counts for merged PRs (how many
 files depend on what they touched) and codemap's predicted collisions among the
 PRs still open. One message, to Slack or stdout.
 
@@ -89,15 +89,9 @@ def blast_level(files):
     return "low", top
 
 
-def likelihood(pair):
-    # ponytail: same heuristic as collide-check.sh; calibrate from its artifact.
-    if pair["shared_file_count"] >= 3 or (pair.get("top_importers_known") and pair.get("top_importer_count", 0) >= 3):
-        return "high"
-    if pair["shared_file_count"] == 2:
-        return "medium"
-    if pair.get("top_importers_known"):
-        return "low"
-    return "unknown"
+def hubs_word(files):
+    n = sum(1 for f in files if f[2])
+    return f"{n} hub{'s' if n != 1 else ''} touched"
 
 
 def repo_section(owner, name, since, work, codemap):
@@ -138,7 +132,7 @@ def repo_section(owner, name, since, work, codemap):
         level, top = blast_level(files)
         if level in ("high", "medium"):
             highs += level == "high"
-            lines.append(f"  {level.upper():<6} #{p['number']} \"{p['title'][:48]}\" touched {top[0]} ({top[1]} importers)")
+            lines.append(f"  #{p['number']} \"{p['title'][:48]}\" touched {top[0]} · {top[1]} importers · {hubs_word(files)} · blast {level}")
     if len(merged) > PR_CAP:
         lines.append(f"  {len(merged) - PR_CAP} more merged PRs not measured (cap {PR_CAP})")
     if capped:
@@ -164,8 +158,9 @@ def repo_section(owner, name, since, work, codemap):
         except (json.JSONDecodeError, subprocess.TimeoutExpired):
             report = {}
         for pair in report.get("pairs") or []:
+            top_n = pair.get("top_importer_count") if pair.get("top_importers_known") else None
             lines.append(f"  predicted: #{pair['a']} + #{pair['b']} share {pair['shared_file_count']} file(s) "
-                         f"({pair['top_file']}) · likelihood {likelihood(pair)}")
+                         f"({pair['top_file']}, {top_n if top_n is not None else 'importers unknown'}{' importers' if top_n is not None else ''})")
 
     return lines, len(opened), len(merged), len(still_open), highs
 
@@ -195,7 +190,7 @@ def main():
             out.extend(lines)
             for i, v in enumerate((o, m, s, h)):
                 totals[i] += v
-        out.append(f"Fleet: {totals[0]} opened · {totals[1]} merged · {totals[2]} open · {totals[3]} high blast radius")
+        out.append(f"Fleet: {totals[0]} opened · {totals[1]} merged · {totals[2]} open · {totals[3]} PRs touched a file with 9+ importers or 2 hubs")
         text = "\n".join(out)
     finally:
         shutil.rmtree(work, ignore_errors=True)
