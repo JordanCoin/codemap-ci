@@ -1,0 +1,43 @@
+name: ledger
+
+# The morning read: what the fleet opened, merged and left open across repos in
+# the last day, with blast levels and predicted collisions. Posts to Slack when
+# SLACK_LEDGER_WEBHOOK is set; always lands in the job summary.
+#
+# Reading other repos' PRs needs a repo-scoped PAT in CODEMAP_TARGET_TOKEN.
+# Without it the run can only see this repo.
+
+on:
+  schedule:
+    # 13:00 UTC is 09:00 America/New_York in standard time and 08:00 in
+    # daylight time. Cron has no zone; move to 12:00 in summer if it matters.
+    - cron: "0 13 * * *"
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: "Comma-separated repo names under the owner"
+        required: false
+        default: "aswb-backend,ASWB-Web-App,SWTPA-iOS,community-os,codemap"
+      hours:
+        description: "Window in hours"
+        required: false
+        default: "24"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  ledger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Write the ledger
+        env:
+          GH_TOKEN: ${{ secrets.CODEMAP_TARGET_TOKEN || github.token }}
+          SLACK_LEDGER_WEBHOOK: ${{ secrets.SLACK_LEDGER_WEBHOOK }}
+          REPOS: ${{ github.event.inputs.repos || 'aswb-backend,ASWB-Web-App,SWTPA-iOS,community-os,codemap' }}
+          HOURS: ${{ github.event.inputs.hours || '24' }}
+        run: python3 scripts/ledger.py --repos "$REPOS" --hours "$HOURS"
