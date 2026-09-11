@@ -27,18 +27,22 @@ inputs:
     description: "Branch the pairs are merged onto. Defaults to target-repo's default branch."
     required: false
     default: ""
-  codemap-repo:
-    description: "Git URL codemap is built from."
+  codemap-version:
+    description: "codemap release to download. The tarball also carries ast-grep, so importer counts are real."
     required: false
-    default: "https://github.com/JordanCoin/codemap.git"
-  codemap-ref:
-    description: "Ref of codemap-repo to build. `collide` shipped in codemap #180, so main carries it."
+    default: "4.5.1"
+  comment:
+    description: "Post a sticky comment on this PR (and on the other half of any failing pair). Needs pull-requests: write."
     required: false
-    default: "main"
-  go-version:
-    description: "Go toolchain used to build codemap (and, by default, the pairs)."
+    default: "true"
+  all-pairs:
+    description: "Build every predicted pair, not only the ones that include this-pr."
     required: false
-    default: "1.24"
+    default: "false"
+  pair-timeout:
+    description: "Seconds allowed for one pair's build before it is reported as timed out."
+    required: false
+    default: "600"
   github-token:
     description: "Token gh uses to read target-repo's open PRs and fetch their heads."
     required: true
@@ -47,14 +51,11 @@ inputs:
     required: false
     default: ""
 
+# The action installs nothing but codemap. Whatever toolchain build-command
+# needs (Go, Node, Rust) is the workflow's job to set up before this step.
 runs:
   using: composite
   steps:
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: ${{ inputs.go-version }}
-
     - name: Run collide check
       shell: bash
       env:
@@ -63,8 +64,10 @@ runs:
         BUILD_COMMAND: ${{ inputs.build-command }}
         MIN_IMPORTERS: ${{ inputs.min-importers }}
         BASE_BRANCH: ${{ inputs.base-branch }}
-        CODEMAP_REPO: ${{ inputs.codemap-repo }}
-        CODEMAP_REF: ${{ inputs.codemap-ref }}
+        CODEMAP_VERSION: ${{ inputs.codemap-version }}
+        COMMENT: ${{ inputs.comment }}
+        ALL_PAIRS: ${{ inputs.all-pairs }}
+        PAIR_TIMEOUT: ${{ inputs.pair-timeout }}
         GH_TOKEN: ${{ inputs.github-token }}
         THIS_PR: ${{ inputs.this-pr }}
       run: bash "$GITHUB_ACTION_PATH/scripts/collide-check.sh"

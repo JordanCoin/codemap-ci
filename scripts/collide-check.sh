@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# collide-check.sh — pair-build the open PRs that codemap predicts will collide.
+# collide-check.sh: pair-build the open PRs that codemap predicts will collide.
 #
 # CI builds every PR against the base branch and never against its siblings.
 # This script closes that blind spot: it asks `codemap collide` which open PRs
@@ -8,18 +8,22 @@
 # worktree and runs the repo's build command on the result.
 #
 # Environment (all set by action.yml, all overridable when run by hand):
-#   TARGET_REPO     owner/name whose open PRs are read (required)
-#   TARGET_DIR      path to a git checkout of TARGET_REPO (default: $PWD)
-#   BUILD_COMMAND   command run in each merged worktree
-#   MIN_IMPORTERS   passed to codemap collide --min-importers
-#   BASE_BRANCH     branch the pairs are merged onto (default: repo default branch)
-#   CODEMAP_REPO    git URL to build codemap from
-#   CODEMAP_REF     ref of CODEMAP_REPO to build
-#   CODEMAP_BIN     path to a prebuilt codemap; skips the build when set
-#   SUMMARY_FILE    markdown destination (default: $GITHUB_STEP_SUMMARY, else stdout)
-#   GH_TOKEN        token gh uses to read TARGET_REPO's open PRs
+#   TARGET_REPO      owner/name whose open PRs are read (required)
+#   TARGET_DIR       path to a git checkout of TARGET_REPO (default: $PWD)
+#   BUILD_COMMAND    command run in each merged worktree
+#   MIN_IMPORTERS    passed to codemap collide --min-importers
+#   BASE_BRANCH      branch the pairs are merged onto (default: repo default branch)
+#   CODEMAP_VERSION  codemap release to download (default: 4.5.1)
+#   CODEMAP_BIN      path to a prebuilt codemap; skips the download when set
+#   THIS_PR          the PR this run belongs to; scopes builds and the exit code
+#   ALL_PAIRS        "true" builds every predicted pair even when THIS_PR is set
+#   PAIR_TIMEOUT     seconds allowed per pair build (default: 600)
+#   COMMENT          "true" posts a sticky comment on THIS_PR (default: true)
+#   SUMMARY_FILE     markdown destination (default: $GITHUB_STEP_SUMMARY, else none)
+#   GH_TOKEN         token gh uses to read TARGET_REPO's open PRs
 #
-# Exit status: 0 when every predicted pair builds, 1 when any pair fails.
+# Exit status: 0 when every built pair passes, 1 when a pair fails. With THIS_PR
+# set, only a failing pair that includes THIS_PR fails the run.
 
 set -euo pipefail
 
@@ -28,18 +32,20 @@ TARGET_DIR="${TARGET_DIR:-$PWD}"
 BUILD_COMMAND="${BUILD_COMMAND:-go build ./... && go vet ./...}"
 MIN_IMPORTERS="${MIN_IMPORTERS:-0}"
 BASE_BRANCH="${BASE_BRANCH:-}"
-CODEMAP_REPO="${CODEMAP_REPO:-https://github.com/JordanCoin/codemap.git}"
-CODEMAP_REF="${CODEMAP_REF:-main}"
+CODEMAP_VERSION="${CODEMAP_VERSION:-4.5.1}"
 CODEMAP_BIN="${CODEMAP_BIN:-}"
+THIS_PR="${THIS_PR:-}"
+ALL_PAIRS="${ALL_PAIRS:-false}"
+PAIR_TIMEOUT="${PAIR_TIMEOUT:-600}"
+COMMENT="${COMMENT:-true}"
 SUMMARY_FILE="${SUMMARY_FILE:-${GITHUB_STEP_SUMMARY:-}}"
-THIS_PR="${THIS_PR:-}" # when set, only a failing pair that includes this PR fails the run
 
 die() {
 	echo "collide-check: $*" >&2
 	exit 2
 }
 
-for tool in git gh jq; do
+for tool in git gh jq curl tar; do
 	command -v "$tool" >/dev/null || die "$tool not found on PATH"
 done
 [ -n "$TARGET_REPO" ] || die "TARGET_REPO is required (owner/name)"
@@ -49,7 +55,6 @@ TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"
 
 WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/collide-check.XXXXXX")"
 cleanup() {
-	# Worktrees live inside WORK_ROOT; drop git's registrations before the files.
 	if [ -d "$TARGET_DIR/.git" ]; then
 		git -C "$TARGET_DIR" worktree prune
 	fi
@@ -57,62 +62,95 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ---------------------------------------------------------------------------
-# 1. codemap binary
-# ---------------------------------------------------------------------------
-if [ -z "$CODEMAP_BIN" ]; then
-	command -v go >/dev/null || die "go not found on PATH and CODEMAP_BIN is unset"
-	echo "collide-check: building codemap from $CODEMAP_REPO@$CODEMAP_REF" >&2
-	# codemap's go.mod declares `module codemap`, not a github.com/... path, so
-	# `go install github.com/JordanCoin/codemap@ref` cannot resolve it. Clone.
-	git clone --depth 1 --branch "$CODEMAP_REF" "$CODEMAP_REPO" "$WORK_ROOT/codemap-src"
-	( cd "$WORK_ROOT/codemap-src" && go build -o "$WORK_ROOT/codemap" . )
-	CODEMAP_BIN="$WORK_ROOT/codemap"
-fi
-[ -x "$CODEMAP_BIN" ] || die "codemap binary $CODEMAP_BIN is not executable"
+# Merges need an identity; passed per command so the target checkout's
+# .git/config is never written.
+GIT_ID=(-c user.name=codemap-ci -c user.email=codemap-ci@users.noreply.github.com)
 
 # ---------------------------------------------------------------------------
-# 2. base branch
+# 1. codemap binary: a release tarball that also carries ast-grep and the rules
+# ---------------------------------------------------------------------------
+if [ -z "$CODEMAP_BIN" ]; then
+	os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+	case "$(uname -m)" in
+	x86_64 | amd64) arch=amd64 ;;
+	aarch64 | arm64) arch=arm64 ;;
+	*) die "unsupported architecture $(uname -m)" ;;
+	esac
+	asset="codemap-full_${CODEMAP_VERSION}_${os}_${arch}.tar.gz"
+	base_url="https://github.com/JordanCoin/codemap/releases/download/v${CODEMAP_VERSION}"
+	echo "collide-check: downloading $asset" >&2
+	mkdir -p "$WORK_ROOT/codemap-dist"
+	curl -fsSL --retry 3 -o "$WORK_ROOT/$asset" "$base_url/$asset" ||
+		die "could not download $base_url/$asset"
+	if curl -fsSL -o "$WORK_ROOT/checksums.txt" "$base_url/checksums.txt" 2>/dev/null; then
+		expected="$(awk -v a="$asset" '$2 == a { print $1 }' "$WORK_ROOT/checksums.txt")"
+		if [ -n "$expected" ]; then
+			actual="$(sha256sum "$WORK_ROOT/$asset" 2>/dev/null || shasum -a 256 "$WORK_ROOT/$asset")"
+			actual="${actual%% *}"
+			[ "$actual" = "$expected" ] || die "sha256 mismatch for $asset"
+		fi
+	fi
+	tar xzf "$WORK_ROOT/$asset" -C "$WORK_ROOT/codemap-dist"
+	export PATH="$WORK_ROOT/codemap-dist:$PATH"
+	CODEMAP_BIN="$WORK_ROOT/codemap-dist/codemap"
+fi
+[ -x "$CODEMAP_BIN" ] || die "codemap binary $CODEMAP_BIN is not executable"
+CODEMAP_VERSION_SEEN="$("$CODEMAP_BIN" --version 2>/dev/null | awk '{print $2}')"
+
+# ---------------------------------------------------------------------------
+# 2. base branch and the open PR list (titles and authors for the summary)
 # ---------------------------------------------------------------------------
 if [ -z "$BASE_BRANCH" ]; then
 	BASE_BRANCH="$(gh repo view "$TARGET_REPO" --json defaultBranchRef --jq '.defaultBranchRef.name')"
 fi
 [ -n "$BASE_BRANCH" ] || die "could not determine the base branch of $TARGET_REPO"
 
+PRS="$WORK_ROOT/prs.json"
+gh pr list --repo "$TARGET_REPO" --state open --limit 100 \
+	--json number,title,author,headRefName >"$PRS"
+pr_title() { jq -r --argjson n "$1" '.[] | select(.number == $n) | .title' "$PRS"; }
+pr_author() { jq -r --argjson n "$1" '.[] | select(.number == $n) | .author.login' "$PRS"; }
+
 # ---------------------------------------------------------------------------
 # 3. predict
 # ---------------------------------------------------------------------------
 REPORT="$WORK_ROOT/collide.json"
 echo "collide-check: codemap collide --repo $TARGET_REPO --min-importers $MIN_IMPORTERS" >&2
-( cd "$TARGET_DIR" && "$CODEMAP_BIN" collide --json --repo "$TARGET_REPO" --min-importers "$MIN_IMPORTERS" ) >"$REPORT"
+(cd "$TARGET_DIR" && "$CODEMAP_BIN" collide --json --repo "$TARGET_REPO" --min-importers "$MIN_IMPORTERS") >"$REPORT"
 
-TRUST="$(jq -r '.trust // "UNKNOWN"' "$REPORT")"
+TRUST="$(jq -r '.trust // "unknown"' "$REPORT")"
 COVERAGE="$(jq -r '.coverage.status // "unknown"' "$REPORT")"
 PR_COUNT="$(jq -r '.prs | length' "$REPORT")"
-PAIR_COUNT="$(jq -r '.pairs | length' "$REPORT")"
+SHARED_COUNT="$(jq -r '.shared_files | length' "$REPORT")"
 HIDDEN="$(jq -r '.hidden_by_min_importers // 0' "$REPORT")"
 
-# ---------------------------------------------------------------------------
-# 4. fetch every PR head named in a predicted pair
-# ---------------------------------------------------------------------------
-PAIR_PRS="$(jq -r '[.pairs[] | .a, .b] | unique | .[]' "$REPORT")"
-if [ -n "$PAIR_PRS" ]; then
-	while read -r number; do
-		[ -n "$number" ] || continue
-		git -C "$TARGET_DIR" fetch --force origin \
-			"pull/$number/head:refs/collide-check/pr-$number"
-	done <<<"$PAIR_PRS"
+# Pairs to build in this run, and the ones left to their own PRs' runs.
+if [ -n "$THIS_PR" ] && [ "$ALL_PAIRS" != "true" ]; then
+	BUILD_PAIRS="$(jq -c --argjson n "$THIS_PR" '[.pairs[] | select(.a == $n or .b == $n)]' "$REPORT")"
+	OTHER_PAIRS="$(jq -c --argjson n "$THIS_PR" '[.pairs[] | select(.a != $n and .b != $n)]' "$REPORT")"
+else
+	BUILD_PAIRS="$(jq -c '.pairs' "$REPORT")"
+	OTHER_PAIRS='[]'
 fi
-git -C "$TARGET_DIR" fetch --force origin "$BASE_BRANCH:refs/collide-check/base"
-
-# Merges need an identity. Passed per-command with -c rather than written with
-# `git config`, so running this against a working checkout leaves no trace.
-GIT_ID=(-c "user.name=codemap-ci" -c "user.email=codemap-ci@users.noreply.github.com")
+BUILD_COUNT="$(jq 'length' <<<"$BUILD_PAIRS")"
 
 # ---------------------------------------------------------------------------
-# 5. pair builds
+# 4. fetch base and every PR head we will merge (plus THIS_PR for blast radius)
 # ---------------------------------------------------------------------------
-RESULTS="$WORK_ROOT/results.tsv" # a<TAB>b<TAB>status<TAB>errfile
+git -C "$TARGET_DIR" fetch --force --quiet origin "$BASE_BRANCH:refs/collide-check/base"
+FETCH_PRS="$(jq -r '[.[] | .a, .b] | unique | .[]' <<<"$BUILD_PAIRS")"
+if [ -n "$THIS_PR" ]; then
+	FETCH_PRS="$(printf '%s\n%s\n' "$FETCH_PRS" "$THIS_PR" | sort -un)"
+fi
+while read -r number; do
+	[ -n "$number" ] || continue
+	git -C "$TARGET_DIR" fetch --force --quiet origin "pull/$number/head:refs/collide-check/pr-$number"
+done <<<"$FETCH_PRS"
+
+# ---------------------------------------------------------------------------
+# 5. pair builds. Every failure mode becomes a status; the summary always runs.
+# ---------------------------------------------------------------------------
+RESULTS="$WORK_ROOT/results.tsv" # a<TAB>b<TAB>status<TAB>logfile
 : >"$RESULTS"
 FAILED=0
 FAILED_MINE=0
@@ -120,30 +158,35 @@ FAILED_MINE=0
 build_pair() {
 	local a="$1" b="$2"
 	local wt="$WORK_ROOT/pair-$a-$b"
-	local err="$WORK_ROOT/pair-$a-$b.log"
+	local log="$WORK_ROOT/pair-$a-$b.log"
 	local status="pass"
 
-	git -C "$TARGET_DIR" worktree add --detach "$wt" "refs/collide-check/base" >&2
-
-	local merged=1
-	local ref
-	for ref in "refs/collide-check/pr-$a" "refs/collide-check/pr-$b"; do
-		if ! git -C "$wt" "${GIT_ID[@]}" merge --no-edit "$ref" >"$err.merge" 2>&1; then
-			status="merge conflict"
-			cp "$err.merge" "$err"
-			merged=0
-			break
+	if ! git -C "$TARGET_DIR" worktree add --detach "$wt" "refs/collide-check/base" >"$log" 2>&1; then
+		status="worktree failed"
+	else
+		local ref
+		for ref in "refs/collide-check/pr-$a" "refs/collide-check/pr-$b"; do
+			if ! git "${GIT_ID[@]}" -C "$wt" merge --no-edit "$ref" >"$log" 2>&1; then
+				status="merge conflict"
+				break
+			fi
+		done
+		if [ "$status" = "pass" ]; then
+			set +e
+			(cd "$wt" && timeout "$PAIR_TIMEOUT" bash -c "$BUILD_COMMAND") >"$log" 2>&1
+			local rc=$?
+			set -e
+			if [ "$rc" -eq 124 ]; then
+				status="timed out"
+				echo "build exceeded ${PAIR_TIMEOUT}s" >>"$log"
+			elif [ "$rc" -ne 0 ]; then
+				status="build failed"
+			fi
 		fi
-	done
-
-	if [ "$merged" -eq 1 ]; then
-		if ! ( cd "$wt" && bash -c "$BUILD_COMMAND" ) >"$err" 2>&1; then
-			status="build failed"
-		fi
+		git -C "$TARGET_DIR" worktree remove --force "$wt" >/dev/null 2>&1 || true
 	fi
 
-	git -C "$TARGET_DIR" worktree remove --force "$wt"
-	printf '%s\t%s\t%s\t%s\n' "$a" "$b" "$status" "$err" >>"$RESULTS"
+	printf '%s\t%s\t%s\t%s\n' "$a" "$b" "$status" "$log" >>"$RESULTS"
 	if [ "$status" != "pass" ]; then
 		FAILED=$((FAILED + 1))
 		if [ -n "$THIS_PR" ] && { [ "$a" = "$THIS_PR" ] || [ "$b" = "$THIS_PR" ]; }; then
@@ -153,87 +196,143 @@ build_pair() {
 	echo "collide-check: #$a + #$b -> $status" >&2
 }
 
-if [ "$PAIR_COUNT" -gt 0 ]; then
-	while read -r a b; do
-		[ -n "$a" ] || continue
-		build_pair "$a" "$b"
-	done < <(jq -r '.pairs[] | "\(.a) \(.b)"' "$REPORT")
+while read -r a b; do
+	[ -n "$a" ] || continue
+	build_pair "$a" "$b"
+done < <(jq -r '.[] | "\(.a) \(.b)"' <<<"$BUILD_PAIRS")
+
+# ---------------------------------------------------------------------------
+# 6. blast radius of THIS_PR: which of its files do other files depend on
+# ---------------------------------------------------------------------------
+BLAST="$WORK_ROOT/blast.tsv" # count<TAB>path
+: >"$BLAST"
+BLAST_NOTE=""
+if [ -n "$THIS_PR" ]; then
+	changed="$(git -C "$TARGET_DIR" diff --name-only "refs/collide-check/base...refs/collide-check/pr-$THIS_PR" 2>/dev/null || true)"
+	changed_count="$(printf '%s' "$changed" | grep -c . || true)"
+	if [ "$changed_count" -gt 30 ]; then
+		BLAST_NOTE="$changed_count files changed; importer lookup skipped above 30."
+	else
+		while read -r path; do
+			[ -n "$path" ] || continue
+			[ -f "$TARGET_DIR/$path" ] || continue
+			n="$(cd "$TARGET_DIR" && "$CODEMAP_BIN" --json --importers "$path" 2>/dev/null | jq -r '.importer_count // 0' || echo 0)"
+			[ "${n:-0}" -gt 0 ] && printf '%s\t%s\n' "$n" "$path" >>"$BLAST"
+		done <<<"$changed"
+		sort -rn -o "$BLAST" "$BLAST"
+	fi
 fi
 
 # ---------------------------------------------------------------------------
-# 6. markdown summary (format: codemap issue #134)
+# 7. verdict, annotations, summary
 # ---------------------------------------------------------------------------
-MD="$WORK_ROOT/summary.md"
+pair_shared() { # top file line for a pair from the report
+	jq -r --argjson a "$1" --argjson b "$2" '.pairs[] | select(.a == $a and .b == $b) |
+		"\(.top_file) (" + (if .top_importers_known then (.top_importer_count | tostring) + " importers" else "importers unknown" end) + ")" +
+		(if .shared_file_count > 1 then " · +\(.shared_file_count - 1) more" else "" end)' "$REPORT"
+}
+
+VERDICT=""
+if [ -n "$THIS_PR" ]; then
+	if [ "$FAILED_MINE" -gt 0 ]; then
+		others="$(awk -F'\t' -v me="$THIS_PR" '$3 != "pass" { print ($1 == me) ? $2 : $1 }' "$RESULTS" | sort -un)"
+		parts=()
+		while read -r o; do
+			[ -n "$o" ] || continue
+			parts+=("#$o \"$(pr_title "$o")\" by @$(pr_author "$o")")
+		done <<<"$others"
+		joined="$(IFS=';' && printf '%s' "${parts[*]}" | sed 's/;/ and /g')"
+		VERDICT="This PR (#$THIS_PR) does not build together with $joined. Each is green alone. Whichever merges second breaks $BASE_BRANCH."
+	elif [ "$BUILD_COUNT" -gt 0 ]; then
+		VERDICT="No merge-order hazard for #$THIS_PR. Built against $BUILD_COUNT open PR(s) that share files with it; all pass."
+	else
+		VERDICT="No open PR shares a file with #$THIS_PR."
+	fi
+else
+	VERDICT="$PR_COUNT open PR(s), $SHARED_COUNT shared file(s), $BUILD_COUNT pair(s) built, $FAILED failing."
+fi
+echo "::notice title=codemap collide::$VERDICT"
+
+# Inline annotations on THIS_PR's diff for compiler-style "path:line: msg" lines.
+if [ -n "$THIS_PR" ] && [ "$FAILED_MINE" -gt 0 ]; then
+	while IFS=$'\t' read -r a b status log; do
+		[ "$status" = "pass" ] && continue
+		{ [ "$a" = "$THIS_PR" ] || [ "$b" = "$THIS_PR" ]; } || continue
+		head -10 "$log" | sed -E -n 's#^\.?/?([^:[:space:]]+\.[A-Za-z0-9]+):([0-9]+)(:[0-9]+)?:[[:space:]]*(.+)$#\1\t\2\t\4#p' |
+			while IFS=$'\t' read -r file line msg; do
+				echo "::error file=$file,line=$line,title=collide #$a + #$b::$msg"
+			done
+	done <"$RESULTS"
+fi
+
+BODY="$WORK_ROOT/body.md" # summary without the H2, reused for the comment
 {
-	echo "## codemap collide — merge-order hazard"
-	echo
-	echo "\`$TARGET_REPO\` · base \`$BASE_BRANCH\` · $PR_COUNT open PR(s) · trust \`$TRUST\` · coverage \`$COVERAGE\` · \`--min-importers $MIN_IMPORTERS\`"
-	echo
-	echo "> CI builds every PR against \`$BASE_BRANCH\` and never against its siblings."
+	echo "**$VERDICT**"
 	echo
 
-	echo "### SHARED FILES (each = a merge-order hazard)"
-	echo
-	echo '```'
-	if [ "$(jq -r '.shared_files | length' "$REPORT")" -eq 0 ]; then
-		echo "  none"
-	else
-		jq -r '.shared_files[] |
-			"  \(.prs | length) PRs   \(.path)   <- " +
-			(.prs | map("#" + (. | tostring)) | join(", ")) +
-			"   [" + (if .importers_known then ((.importer_count | tostring) + " " + .importer_scope + " importers") else "importers unknown" end) + "]"' "$REPORT"
-	fi
-	if [ "$HIDDEN" -gt 0 ]; then
-		echo "  ($HIDDEN shared file(s) hidden by --min-importers $MIN_IMPORTERS)"
-	fi
-	echo '```'
-	echo
-
-	echo "### PREDICTED COLLIDING PAIRS"
-	echo
-	echo '```'
-	if [ "$PAIR_COUNT" -eq 0 ]; then
-		echo "  none"
-	else
-		jq -r '.pairs[] |
-			"  #\(.a) + #\(.b)  ->  \(.shared_file_count) shared file(s)   top: \(.top_file)"' "$REPORT"
-	fi
-	echo '```'
-	echo
-
-	echo "### Pair builds"
-	echo
-	echo "| Pair | Result | Error |"
-	echo "| --- | --- | --- |"
-	if [ ! -s "$RESULTS" ]; then
-		echo "| — | no predicted pairs to build | |"
-	else
-		while IFS=$'\t' read -r a b status err; do
-			if [ "$status" = "pass" ]; then
-				echo "| #$a + #$b | ✅ pass | |"
-			else
-				# First 20 lines of the failure, flattened into one table cell.
-				detail="$(head -20 "$err" | sed 's/|/\\|/g' | sed 's/$/<br>/' | tr -d '\n')"
-				echo "| #$a + #$b | ❌ $status | <pre>$detail</pre> |"
-			fi
+	if awk -F'\t' '$3 != "pass"' "$RESULTS" | grep -q .; then
+		echo "### Failing pairs"
+		echo
+		while IFS=$'\t' read -r a b status log; do
+			[ "$status" = "pass" ] && continue
+			echo "**#$a + #$b** · $status · shared: $(pair_shared "$a" "$b")"
+			echo
+			echo '```'
+			head -12 "$log"
+			echo '```'
+			echo
 		done <"$RESULTS"
 	fi
-	echo
 
-	if [ "$FAILED" -gt 0 ]; then
-		echo "**$FAILED predicted pair(s) do not build together.** Each one is green on its own."
-		if [ -n "$THIS_PR" ]; then
-			if [ "$FAILED_MINE" -gt 0 ]; then
-				echo
-				echo "PR #$THIS_PR is part of $FAILED_MINE of them, so this check fails for it."
-			else
-				echo
-				echo "PR #$THIS_PR is not part of any failing pair, so this check passes for it. The failing pairs belong to other open PRs."
-			fi
-		fi
-	else
-		echo "All predicted pairs build together."
+	if awk -F'\t' '$3 == "pass"' "$RESULTS" | grep -q .; then
+		echo "### Passing pairs"
+		echo
+		while IFS=$'\t' read -r a b status log; do
+			[ "$status" = "pass" ] || continue
+			echo "- #$a + #$b · shared: $(pair_shared "$a" "$b")"
+		done <"$RESULTS"
+		echo
 	fi
+
+	if [ "$(jq 'length' <<<"$OTHER_PAIRS")" -gt 0 ]; then
+		echo "### Predicted, not built in this run"
+		echo
+		jq -r '.[] | "- #\(.a) + #\(.b) · shared: \(.top_file)"' <<<"$OTHER_PAIRS"
+		echo
+		echo "These pairs do not include #$THIS_PR; their own PRs' runs build them."
+		echo
+	fi
+
+	if [ -s "$BLAST" ] || [ -n "$BLAST_NOTE" ]; then
+		echo "### Files in this PR that others depend on"
+		echo
+		if [ -n "$BLAST_NOTE" ]; then
+			echo "$BLAST_NOTE"
+		else
+			head -5 "$BLAST" | awk -F'\t' '{ printf "- `%s` · %s importers\n", $2, $1 }'
+		fi
+		echo
+	fi
+
+	echo "### Coverage"
+	echo
+	echo "trust \`$TRUST\` · coverage \`$COVERAGE\` · $PR_COUNT open PRs · $SHARED_COUNT shared files · codemap $CODEMAP_VERSION_SEEN"
+	if [ "$HIDDEN" -gt 0 ]; then
+		echo "· $HIDDEN shared file(s) hidden by \`--min-importers $MIN_IMPORTERS\`"
+	fi
+	case "$TRUST/$COVERAGE" in
+	*low* | */partial | */unavailable)
+		echo
+		echo "Importer counts may be missing for some files, so a hazard can be under-ranked. Tune \`.codemap/config.json\` in the target repo to cover its source tree."
+		;;
+	esac
+} >"$BODY"
+
+MD="$WORK_ROOT/summary.md"
+{
+	echo "## codemap collide"
+	echo
+	cat "$BODY"
 } >"$MD"
 
 if [ -n "$SUMMARY_FILE" ]; then
@@ -241,13 +340,44 @@ if [ -n "$SUMMARY_FILE" ]; then
 fi
 cat "$MD"
 
-if [ -n "$THIS_PR" ]; then
-	if [ "$FAILED_MINE" -gt 0 ]; then
-		exit 1
+# ---------------------------------------------------------------------------
+# 8. sticky comment on THIS_PR and on the other half of each failing pair
+# ---------------------------------------------------------------------------
+MARKER="<!-- codemap-ci:collide -->"
+upsert_comment() {
+	local number="$1"
+	local payload="$WORK_ROOT/comment-$number.json"
+	jq -n --arg body "$MARKER"$'\n'"$(cat "$BODY")" '{body: $body}' >"$payload"
+	local existing
+	existing="$(gh api "repos/$TARGET_REPO/issues/$number/comments" --paginate \
+		--jq "[.[] | select(.body | startswith(\"$MARKER\"))] | .[0].id // empty" 2>/dev/null || true)"
+	local out rc
+	set +e
+	if [ -n "$existing" ]; then
+		out="$(gh api -X PATCH "repos/$TARGET_REPO/issues/comments/$existing" --input "$payload" 2>&1)"
+	else
+		out="$(gh api -X POST "repos/$TARGET_REPO/issues/$number/comments" --input "$payload" 2>&1)"
 	fi
+	rc=$?
+	set -e
+	if [ "$rc" -ne 0 ]; then
+		echo "::warning title=codemap collide::could not comment on #$number (needs pull-requests: write): ${out:0:200}"
+	else
+		echo "collide-check: commented on #$number" >&2
+	fi
+}
+
+if [ "$COMMENT" = "true" ] && [ -n "$THIS_PR" ]; then
+	upsert_comment "$THIS_PR"
+	awk -F'\t' -v me="$THIS_PR" '$3 != "pass" && ($1 == me || $2 == me) { print ($1 == me) ? $2 : $1 }' "$RESULTS" |
+		sort -un | while read -r other; do
+		[ -n "$other" ] && upsert_comment "$other"
+	done
+fi
+
+if [ -n "$THIS_PR" ]; then
+	[ "$FAILED_MINE" -gt 0 ] && exit 1
 	exit 0
 fi
-if [ "$FAILED" -gt 0 ]; then
-	exit 1
-fi
+[ "$FAILED" -gt 0 ] && exit 1
 exit 0
