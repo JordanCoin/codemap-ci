@@ -242,7 +242,13 @@ if [ -n "$THIS_PR" ]; then
 			parts+=("#$o \"$(pr_title "$o")\" by @$(pr_author "$o")")
 		done <<<"$others"
 		joined="$(IFS=';' && printf '%s' "${parts[*]}" | sed 's/;/ and /g')"
-		VERDICT="This PR (#$THIS_PR) does not build together with $joined. Each is green alone. Whichever merges second breaks $BASE_BRANCH."
+		# A textual conflict and a compile failure are different news: the first
+		# blocks whoever merges second, the second lets both merge and breaks main.
+		if awk -F'\t' -v me="$THIS_PR" '($1 == me || $2 == me) && $3 != "pass" && $3 != "merge conflict" { found = 1 } END { exit !found }' "$RESULTS"; then
+			VERDICT="This PR (#$THIS_PR) does not build together with $joined. Each is green alone. Whichever merges second breaks $BASE_BRANCH."
+		else
+			VERDICT="This PR (#$THIS_PR) conflicts with $joined. Git will refuse whichever merges second, so one of them needs a rebase."
+		fi
 	elif [ "$BUILD_COUNT" -gt 0 ]; then
 		VERDICT="No merge-order hazard for #$THIS_PR. Built against $BUILD_COUNT open PR(s) that share files with it; all pass."
 	else
