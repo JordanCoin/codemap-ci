@@ -1,0 +1,44 @@
+name: review gate
+
+on: [pull_request]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      review: ${{ steps.gate.outputs.review }}
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 } # full history: the base ref must be reachable
+      - uses: JordanCoin/codemap-ci/review-gate@v1
+        id: gate
+        with:
+          license-key: ${{ secrets.CODEMAP_LICENSE_KEY }}
+          github-token: ${{ github.token }}
+
+  # review == "unknown" (no license key, or the API was unreachable) still
+  # runs the review: the gate only ever REMOVES a review it can vouch for
+  # skipping (review == "false"), it never blocks one it isn't sure about.
+  review:
+    needs: gate
+    if: needs.gate.outputs.review != 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: anthropics/claude-code-action@v1
+        with:
+          prompt: "Review this pull request for correctness bugs and risky changes."
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      # Alternative: OpenAI's Codex action instead of Claude Code.
+      # - uses: openai/codex-action@v1
+      #   with:
+      #     prompt: "Review this pull request for correctness bugs and risky changes."
+      #     openai-api-key: ${{ secrets.OPENAI_API_KEY }}

@@ -1,0 +1,55 @@
+name: "codemap review gate"
+description: "Collect free facts about a PR with the codemap CLI and ask a paid API whether an AI agent review is worth running."
+author: "JordanCoin"
+
+branding:
+  icon: "check-circle"
+  color: "blue"
+
+inputs:
+  license-key:
+    description: "codemap Team license key. Without one, facts print to the job summary and review is unknown."
+    required: false
+    default: ""
+  api-url:
+    description: "Base URL of the review-gate API."
+    required: false
+    default: "https://codemap-brief-webhook.vercel.app"
+  base-ref:
+    description: "Ref the changed files are diffed against. Defaults to the pull request's base ref."
+    required: false
+    default: ""
+  codemap-version:
+    description: "codemap release to download. The tarball also carries ast-grep, so importer counts are real."
+    required: false
+    default: "4.5.1"
+  github-token:
+    description: "Token available for authenticated git and GitHub API calls the gate may need to read PR context."
+    required: true
+
+outputs:
+  review:
+    description: "true, false, or unknown"
+    value: ${{ steps.gate.outputs.review }}
+  reasons:
+    description: "One-line summary of why."
+    value: ${{ steps.gate.outputs.reasons }}
+  decision-json:
+    description: "Path to the full decision JSON returned by the API (or the local facts-only decision)."
+    value: ${{ steps.gate.outputs.decision-json }}
+
+# The action installs only codemap. It never downloads or runs the AI agent
+# review itself; that stays a separate job gated on this one's `review` output.
+runs:
+  using: composite
+  steps:
+    - name: Run review gate
+      id: gate
+      shell: bash
+      env:
+        LICENSE_KEY: ${{ inputs.license-key }}
+        API_URL: ${{ inputs.api-url }}
+        BASE_REF: ${{ inputs.base-ref }}
+        CODEMAP_VERSION: ${{ inputs.codemap-version }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: bash "$GITHUB_ACTION_PATH/../scripts/review-gate.sh"
