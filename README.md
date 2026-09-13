@@ -171,6 +171,17 @@ tests in `build-command` (`go build ./... && go test ./...`) and raise
 It does not merge, rebase, or close anything. It builds throwaway worktrees,
 reports, and leaves one comment.
 
+## Review gate
+
+`review-gate/action.yml` collects free facts about a PR (changed files, importer
+counts, hub flags, language, coverage) with the MIT codemap CLI and, with a
+codemap Team license key, POSTs them to a paid API that decides whether an AI
+agent review is worth running. The decision logic, policy, and calibration
+from your past reviews live server-side and are not in this repo. Only paths
+and counts leave the runner, never file contents. Without a key, the facts
+print to the job summary and the gate sets `review: unknown`, which still
+lets a downstream review run — see `examples/review-gate.yml`.
+
 ## Live brief
 
 Each commit on the default branch recomputes the facts and posts them to the brief webhook; the live page picks it up within about a minute.
