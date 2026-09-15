@@ -6,7 +6,7 @@ import "fmt"
 // the only interesting thing about it. See README.md.
 
 func main() {
-	fmt.Println(Greet("world"))
+	fmt.Println(Greet("world", true))
 
 	report()
 }
